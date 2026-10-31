@@ -9,14 +9,14 @@ mod net_link;
 mod protocol;
 mod state_machine;
 
-use audio_bridge::{AudioBridge, AudioEvent};
+use audio_bridge::{AudioBridge, AudioEvent, PlaybackParams};
 use config::Config;
 use controller::CoreController;
 use gui_bridge::{GuiBridge, GuiEvent};
 
 use mac_address::get_mac_address;
 use net_link::{NetCommand, NetEvent, NetLink};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::signal;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -140,13 +140,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 启动网络链接，与小智服务器通信
-    let net_link = NetLink::new(config.clone(), tx_net_event, rx_net_cmd, mcp_server);
+    let playback_params: PlaybackParams = Arc::new(RwLock::new(None));
+    let net_link = NetLink::new(config.clone(), tx_net_event, rx_net_cmd, mcp_server, playback_params.clone());
     tokio::spawn(async move {
         net_link.run().await;
     });
 
     // 启动音频桥（内置音频系统，无需外部进程）
-    let audio_bridge = Arc::new(AudioBridge::start(&config, tx_audio_event)?);
+    let audio_bridge = Arc::new(AudioBridge::start(&config, tx_audio_event, playback_params)?);
 
     // 初始化控制器
     let mut controller = CoreController::new(

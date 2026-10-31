@@ -8,6 +8,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 use uuid::Uuid;
 use std::sync::Arc;
+use crate::audio_bridge::PlaybackParams;
 use crate::mcp_gateway::McpServer;
 
 #[derive(Debug)]
@@ -38,6 +39,10 @@ struct AudioParams {
 struct Features {
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp: Option<bool>,
+    /// Сервер шлёт даунлинк в полном качестве (48к) вместо безопасных 16к:
+    /// клиент подстраивает декодер под audio_params из server hello.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    downlink_hd: Option<bool>,
 }
 
 // Hello Message，用于初始化连接
@@ -57,6 +62,7 @@ pub struct NetLink {
     tx: mpsc::Sender<NetEvent>,
     rx_cmd: mpsc::Receiver<NetCommand>,
     mcp_server: Arc<McpServer>,
+    playback_params: PlaybackParams,
 }
 
 impl NetLink {
@@ -65,8 +71,29 @@ impl NetLink {
         tx: mpsc::Sender<NetEvent>,
         rx_cmd: mpsc::Receiver<NetCommand>,
         mcp_server: Arc<McpServer>,
+        playback_params: PlaybackParams,
     ) -> Self {
-        Self { config, tx, rx_cmd, mcp_server }
+        Self { config, tx, rx_cmd, mcp_server, playback_params }
+    }
+
+    /// Parse the server hello's audio_params (downlink declaration) and store
+    /// them for the playback thread.
+    fn update_playback_params(&self, text: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(text) else { return };
+        if v.get("type").and_then(|t| t.as_str()) != Some("hello") {
+            return;
+        }
+        let Some(ap) = v.get("audio_params") else { return };
+        let rate = ap.get("sample_rate").and_then(|r| r.as_u64()).unwrap_or(0) as u32;
+        let channels = ap.get("channels").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+        if rate >= 8000 && rate <= 96000 && (1..=2).contains(&channels) {
+            if let Ok(mut w) = self.playback_params.write() {
+                if *w != Some((rate, channels)) {
+                    log::info!("Server hello downlink: {}Hz/{}ch", rate, channels);
+                    *w = Some((rate, channels));
+                }
+            }
+        }
     }
 
     // 如果发生错误断开连接，5秒后重连
@@ -133,11 +160,11 @@ impl NetLink {
 
         // 发送Hello消息进行初始化链接
         // 根据配置动态决定是否在 hello 中声明 MCP 能力
-        let features = if self.config.mcp.enabled {
-            Some(Features { mcp: Some(true) })
-        } else {
-            None
-        };
+        // downlink_hd: клиент декодирует любой rate из server hello — просим 48к
+        let features = Some(Features {
+            mcp: if self.config.mcp.enabled { Some(true) } else { None },
+            downlink_hd: Some(true),
+        });
         let hello_msg = HelloMessage {
             msg_type: "hello".to_string(),
             version: 1,
@@ -205,6 +232,7 @@ impl NetLink {
                                     if !handled {
                                         // 正常信令通道处理
                                         log::info!("Received Text: {}", text);
+                                        self.update_playback_params(&text);
                                         self.tx.send(NetEvent::Text(text.to_string())).await?;
                                     }
                                 }

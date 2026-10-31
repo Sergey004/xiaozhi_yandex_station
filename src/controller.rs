@@ -166,6 +166,28 @@ impl CoreController {
                     log::info!("STT Result: {}", text_content);
                 }
             }
+            "llm" => {
+                if let Some(text_content) = &msg.text {
+                    log::info!("LLM emotion/text: {}", text_content);
+                }
+            }
+            "listen" => {
+                // Server-side VAD contract (xiaozhi_bridge): the server decides
+                // when speech ends and sends listen/stop; the client must stop
+                // streaming until it opens listening again.
+                match msg.state.as_deref() {
+                    Some("stop") => {
+                        self.should_mute_mic = true;
+                        self.state = SystemState::Processing;
+                        log::info!("Server listen stop: muting mic until next listen");
+                    }
+                    Some("start") => {
+                        self.should_mute_mic = false;
+                        log::info!("Server listen start: unmuting mic");
+                    }
+                    _ => {}
+                }
+            }
             other => {
                 log::warn!("Unhandled message type: {}", other);
             }
