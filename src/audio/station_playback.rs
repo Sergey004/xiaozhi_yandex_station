@@ -14,6 +14,8 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use anyhow::Result;
 
+use crate::audio_bridge::{AudioEvent, PlayCommand};
+
 use super::opus_codec::OpusDecoder;
 use super::audio_system::AudioConfig;
 
@@ -70,6 +72,9 @@ pub fn playback_thread(
     running: &AtomicBool,
     wav_dir: PathBuf,
     playback_params: Arc<RwLock<Option<(u32, u32)>>>,
+    mut cmd_rx: mpsc::Receiver<PlayCommand>,
+    event_tx: mpsc::Sender<AudioEvent>,
+    rt: tokio::runtime::Handle,
 ) -> Result<()> {
     // Downlink params come from the server hello (sample_rate, channels).
     // Fall back to the local hello config until the server hello arrives.
@@ -77,35 +82,13 @@ pub fn playback_thread(
     let mut decoder: Option<OpusDecoder> = None;
     let mut pcm: Vec<i16> = Vec::new();
     let mut seq: u32 = 0;
+    let mut playing = false;
     log::info!(
         "Station playback: maind --gst-launch, flush {}ms, opus {}Hz/{}ch (awaiting server hello)",
         (FLUSH_SECONDS * 1000.0) as u32,
         config.opus_sample_rate,
         config.opus_channels
     );
-
-    let decode_all = |decoder: &mut Option<OpusDecoder>, cur: (u32, u32), pcm: &mut Vec<i16>, rx: &mut mpsc::Receiver<Vec<u8>>| {
-        let decode_one = |decoder: &mut OpusDecoder, pcm: &mut Vec<i16>, data: Vec<u8>| {
-            match decoder.decode(&data) {
-                Ok(samples) => pcm.extend_from_slice(&samples),
-                Err(e) => log::error!("Audio decode error: {}", e),
-            }
-        };
-        match rx.blocking_recv() {
-            Some(data) => {
-                if let Some(d) = decoder.as_mut() {
-                    decode_one(d, pcm, data);
-                }
-            }
-            None => return false,
-        }
-        while let Ok(data) = rx.try_recv() {
-            if let Some(d) = decoder.as_mut() {
-                decode_one(d, pcm, data);
-            }
-        }
-        true
-    };
 
     while running.load(Ordering::Relaxed) {
         // Pick up server-declared downlink params (re-create decoder on change)
@@ -129,12 +112,58 @@ pub fn playback_thread(
             cur = want;
         }
 
-        if !decode_all(&mut decoder, cur, &mut pcm, &mut rx) {
-            log::info!("Playback channel closed");
-            break;
+        // Ждём пакет или команду (с таймаутом, чтобы проверять running-флаг)
+        enum Action {
+            Timeout,
+            Flush,
+            Packet(Vec<u8>),
+            Closed,
         }
+        let action = rt.block_on(async {
+            let sleep = tokio::time::sleep(std::time::Duration::from_millis(200));
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = &mut sleep => Action::Timeout,
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(PlayCommand::Flush) => Action::Flush,
+                    None => Action::Closed,
+                },
+                pkt = rx.recv() => match pkt {
+                    Some(data) => Action::Packet(data),
+                    None => Action::Closed,
+                },
+            }
+        });
+
+        let mut got_cmd = false;
+        match action {
+            Action::Timeout => continue, // вернуться в начало (running/params)
+            Action::Flush => got_cmd = true,
+            Action::Packet(data) => {
+                if let Some(d) = decoder.as_mut() {
+                    match d.decode(&data) {
+                        Ok(samples) => pcm.extend_from_slice(&samples),
+                        Err(e) => log::error!("Audio decode error: {}", e),
+                    }
+                }
+                while let Ok(data) = rx.try_recv() {
+                    if let Some(d) = decoder.as_mut() {
+                        match d.decode(&data) {
+                            Ok(samples) => pcm.extend_from_slice(&samples),
+                            Err(e) => log::error!("Audio decode error: {}", e),
+                        }
+                    }
+                }
+            }
+            Action::Closed => {
+                log::info!("Playback channel closed");
+                break;
+            }
+        }
+
         let flush_samples = (cur.0 as f32 * FLUSH_SECONDS) as usize;
-        if pcm.len() >= flush_samples {
+        let tail = got_cmd && !pcm.is_empty();
+        if pcm.len() >= flush_samples || tail {
             seq = seq % WAV_SLOTS + 1;
             let wav = wav_dir.join(format!("tts_{}.wav", seq));
             if let Err(e) = write_wav(&wav, &pcm, cur.0) {
@@ -143,6 +172,12 @@ pub fn playback_thread(
                 log::error!("maind playback failed: {}", e);
             }
             pcm.clear();
+        }
+        if got_cmd {
+            // maind закончил — уведомить контроллер (он откроет прослушку)
+            rt.block_on(async {
+                let _ = event_tx.send(AudioEvent::PlaybackFinished).await;
+            });
         }
     }
     log::info!("Station playback stopped");

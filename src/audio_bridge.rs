@@ -6,6 +6,14 @@ use crate::audio::{AudioConfig, AudioSystem};
 
 pub enum AudioEvent {
     AudioData(Vec<u8>),
+    /// Проигрывание очередного WAV-чанка через maind завершилось.
+    PlaybackFinished,
+}
+
+/// Команды playback-потоку станции.
+pub enum PlayCommand {
+    /// Доиграть накопленный хвост и уведомить контроллер.
+    Flush,
 }
 
 /// Downlink audio params declared by the server hello (sample_rate, channels).
@@ -15,6 +23,7 @@ pub type PlaybackParams = Arc<RwLock<Option<(u32, u32)>>>;
 pub struct AudioBridge {
     _audio_system: Option<AudioSystem>,
     play_tx: mpsc::Sender<Vec<u8>>,
+    play_cmd_tx: Option<mpsc::Sender<PlayCommand>>,
 }
 
 impl AudioBridge {
@@ -22,7 +31,11 @@ impl AudioBridge {
     /// - "alsa"    — integrated ALSA record/playback threads (host backend);
     /// - "station" — Quasar vqe_0 tap over a unix datagram socket for capture
     ///               and `maind --gst-launch` WAV playback on the station.
-    pub fn start(config: &Config, tx: mpsc::Sender<AudioEvent>, playback_params: PlaybackParams) -> anyhow::Result<Self> {
+    pub fn start(
+        config: &Config,
+        tx: mpsc::Sender<AudioEvent>,
+        playback_params: PlaybackParams,
+    ) -> anyhow::Result<Self> {
         let audio_config = AudioConfig {
             capture_device: config.capture_device.to_string(),
             playback_device: config.playback_device.to_string(),
@@ -47,6 +60,8 @@ impl AudioBridge {
 
         let (opus_tx, mut opus_rx) = mpsc::channel::<Vec<u8>>(100);
         let (play_tx, play_rx) = mpsc::channel::<Vec<u8>>(400);
+        let (play_cmd_tx, play_cmd_rx) = mpsc::channel::<PlayCommand>(8);
+        let event_tx = tx.clone();
 
         // Forward recorded (encoded) audio as AudioEvent — common to both backends.
         tokio::spawn(async move {
@@ -61,6 +76,7 @@ impl AudioBridge {
             let running = Arc::new(AtomicBool::new(true));
             let socket_path = config.station_capture_socket.clone();
             let wav_dir = std::env::current_dir()?;
+            let rt_handle = tokio::runtime::Handle::current();
             {
                 let running = running.clone();
                 let cfg = audio_config.clone();
@@ -78,12 +94,15 @@ impl AudioBridge {
                 std::thread::Builder::new()
                     .name("station-playback".into())
                     .spawn(move || {
-                        if let Err(e) = crate::audio::station_playback_thread(&cfg, play_rx, &running, wav_dir, playback_params) {
+                        if let Err(e) = crate::audio::station_playback_thread(
+                            &cfg, play_rx, &running, wav_dir, playback_params, play_cmd_rx, event_tx,
+                            rt_handle.clone(),
+                        ) {
                             log::error!("Station playback thread error: {}", e);
                         }
                     })?;
             }
-            return Ok(Self { _audio_system: None, play_tx });
+            return Ok(Self { _audio_system: None, play_tx, play_cmd_tx: Some(play_cmd_tx) });
         }
 
         let audio_system = AudioSystem::start(audio_config, opus_tx, play_rx)?;
@@ -91,7 +110,17 @@ impl AudioBridge {
         Ok(Self {
             _audio_system: Some(audio_system),
             play_tx,
+            play_cmd_tx: Some(play_cmd_tx),
         })
+    }
+
+    /// Доиграть накопленный хвост TTS (station backend).
+    pub async fn flush_playback(&self) {
+        if let Some(cmd) = &self.play_cmd_tx {
+            if let Err(e) = cmd.send(PlayCommand::Flush).await {
+                log::error!("Failed to send flush command: {}", e);
+            }
+        }
     }
 
     /// Send an Opus packet for playback.
