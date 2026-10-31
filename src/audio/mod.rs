@@ -10,7 +10,11 @@ mod opus_codec;
 mod play;
 mod record;
 mod speex;
+mod station_capture;
+mod station_playback;
 pub mod stream_decoder;
 
 pub use audio_system::{AudioConfig, AudioSystem};
+pub use station_capture::capture_thread as station_capture_thread;
+pub use station_playback::playback_thread as station_playback_thread;
 pub use stream_decoder::StreamDecoder;

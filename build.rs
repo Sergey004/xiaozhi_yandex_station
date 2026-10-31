@@ -36,6 +36,14 @@ struct Audio {
     playback_sample_rate: u32,
     playback_channels: u32,
     playback_period_size: usize,
+    #[serde(default = "default_audio_mode")]
+    audio_mode: String,
+    #[serde(default)]
+    station_capture_socket: String,
+}
+
+fn default_audio_mode() -> String {
+    "alsa".to_string()
 }
 
 #[derive(Deserialize)]
@@ -111,6 +119,13 @@ fn main() {
     println!(
         "cargo:rustc-env=AUDIO_PLAYBACK_PERIOD_SIZE={}",
         config.audio.playback_period_size
+    );
+
+    // 音频后端模式 (alsa | station)
+    println!("cargo:rustc-env=AUDIO_MODE={}", config.audio.audio_mode);
+    println!(
+        "cargo:rustc-env=STATION_CAPTURE_SOCKET={}",
+        config.audio.station_capture_socket
     );
 
     // GUI 配置

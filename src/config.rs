@@ -73,8 +73,18 @@ pub struct Config {
     // 功能开关
     pub enable_tts_display: bool,
 
+    // 音频后端: "alsa" (默认) | "station" (Quasar vqe_0 tap + maind gst-launch)
+    #[serde(default = "default_audio_mode")]
+    pub audio_mode: String,
+    #[serde(default)]
+    pub station_capture_socket: String,
+
     // MCP配置
     pub mcp: McpConfig,
+}
+
+fn default_audio_mode() -> String {
+    "alsa".to_string()
 }
 
 impl Config {
@@ -148,6 +158,10 @@ impl Config {
                 .parse()
                 .map_err(|_| "Failed to parse ENABLE_TTS_DISPLAY")?,
 
+            // 音频后端
+            audio_mode: env!("AUDIO_MODE").to_string(),
+            station_capture_socket: env!("STATION_CAPTURE_SOCKET").to_string(),
+
             // MCP配置
             mcp: serde_json::from_str(env!("MCP_CONFIG_JSON"))
                 .map_err(|_| "Failed to parse MCP_CONFIG_JSON")?,
@@ -184,6 +198,21 @@ impl Config {
                 "配置错误：播放采样率 {}Hz 不合法 (支持 8000-192000)",
                 self.playback_sample_rate
             );
+        }
+
+        // 校验音频后端模式
+        match self.audio_mode.as_str() {
+            "alsa" => log::info!("音频后端: alsa (直接 ALSA 采集/播放)"),
+            "station" => {
+                if self.station_capture_socket.trim().is_empty() {
+                    anyhow::bail!("配置错误：audio_mode=station 需要 station_capture_socket");
+                }
+                log::info!(
+                    "音频后端: station (vqe_0 tap {}, playback via maind --gst-launch)",
+                    self.station_capture_socket
+                );
+            }
+            other => anyhow::bail!("配置错误：未知 audio_mode '{}'(支持 alsa|station)", other),
         }
 
         Ok(())
