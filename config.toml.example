@@ -1,0 +1,70 @@
+# Example compile-time configuration.
+# Copy to config.toml and adjust for your device/server:
+#   cp config.toml.example config.toml
+# config.toml is gitignored (device-specific), config.toml.example is the template.
+
+[application]
+name = "xiaozhi"
+version = "1.0.0"
+
+[board]
+type = "xiaozhi"
+name = "xiaozhi"
+
+# Audio devices
+[audio]
+capture_device = "default"
+playback_device = "default"
+# Downlink stream format from the server: "opus" | "pcm" (mp3 reserved)
+stream_format = "opus"
+playback_sample_rate = 48000
+playback_channels = 2
+playback_period_size = 960
+
+# Audio backend: "alsa" (default Linux) | "station" (Yandex Station:
+# mic from Quasar vqe_0 tap, playback via maind --gst-launch)
+# audio_mode = "station"
+# station_capture_socket = "/data/opt/xiaozhi/mic.sock"
+
+# GUI process (UDP IPC), optional
+[gui]
+local_port = 5678
+remote_port = 5679
+local_ip = "0.0.0.0"
+remote_ip = "127.0.0.1"
+buffer_size = 4096
+
+# Network: point at your xiaozhi-protocol server
+[network]
+ws_url = "wss://your-xiaozhi-server.example.com/xiaozhi/v1/"
+ota_url = "https://your-xiaozhi-server.example.com/xiaozhi/ota/"
+ws_token = "your-token"
+# "unknown-device"/"unknown-client" -> generated on first run (MAC/UUID)
+device_id = "unknown-device"
+client_id = "unknown-client"
+
+[features]
+enable_tts_display = true
+
+# Hello (uplink) audio params. Uplink is always resampled to this rate;
+# downlink rate comes from the server hello (HD clients may get 48k).
+[hello_message]
+format = "opus"
+sample_rate = 16000
+channels = 1
+frame_duration = 60
+
+# MCP tools (optional)
+[mcp]
+enabled = false
+
+# [[mcp.tools]]
+# name = "get_system_status"
+# description = "..."
+# type = "subprocess"
+# executable = "./system_status.sh"
+# mode = "sync"
+# timeout_ms = 5000
+# [mcp.tools.input_schema]
+# type = "object"
+# [mcp.tools.input_schema.properties]

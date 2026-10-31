@@ -80,14 +80,21 @@ struct Features {
 // 在编译时读取 config.toml 并设置环境变量
 fn main() {
     println!("cargo:rerun-if-changed=config.toml");
+    println!("cargo:rerun-if-changed=config.toml.example");
 
-    let config_path = Path::new("config.toml");
-    if !config_path.exists() {
-        panic!("config.toml not found!");
-    }
+    // config.toml is device-specific and gitignored; fall back to the example
+    // template so a fresh clone builds out of the box.
+    let config_path = if Path::new("config.toml").exists() {
+        Path::new("config.toml")
+    } else if Path::new("config.toml.example").exists() {
+        println!("cargo:warning=config.toml not found - building with config.toml.example defaults (copy it to config.toml for device-specific settings)");
+        Path::new("config.toml.example")
+    } else {
+        panic!("config.toml not found (and no config.toml.example)!");
+    };
 
-    let config_str = fs::read_to_string(config_path).expect("Failed to read config.toml");
-    let config: Config = toml::from_str(&config_str).expect("Failed to parse config.toml");
+    let config_str = fs::read_to_string(config_path).expect("Failed to read config file");
+    let config: Config = toml::from_str(&config_str).expect("Failed to parse config file");
 
     // 应用和板子信息
     println!("cargo:rustc-env=APP_NAME={}", config.application.name);

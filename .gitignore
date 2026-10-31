@@ -20,3 +20,5 @@ xiaozhi-esp32/
 
 # 忽略日志文件
 *.log
+# device-specific compile-time config (see config.toml.example)
+config.toml
