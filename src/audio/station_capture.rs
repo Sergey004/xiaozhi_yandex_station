@@ -27,6 +27,9 @@ pub fn capture_thread(
     opus_tx: mpsc::Sender<Vec<u8>>,
     running: &AtomicBool,
 ) -> Result<()> {
+    // Убираем осиротевший сокет после падения прошлой сессии, иначе bind
+    // вернёт "Address already in use".
+    let _ = std::fs::remove_file(socket_path);
     let socket = UnixDatagram::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("cannot bind capture socket {}: {}", socket_path, e))?;
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;

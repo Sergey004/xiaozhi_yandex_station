@@ -241,7 +241,12 @@ impl CoreController {
                     }
                     Some("start") => {
                         self.should_mute_mic = false;
-                        log::info!("Server listen start: unmuting mic");
+                        // Подтверждаем свой listen/start: сервер поднимет флаг
+                        // приёма кадров и сбросит VAD (resume после пустого STT)
+                        if self.session_active {
+                            self.send_auto_listen_command().await;
+                        }
+                        log::info!("Server listen start: unmuting mic, re-arming VAD");
                     }
                     _ => {}
                 }
