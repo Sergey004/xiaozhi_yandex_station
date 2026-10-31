@@ -253,8 +253,10 @@ impl CoreController {
                 // continuous: открываем прослушку снова — диалог внутри сессии.
                 if self.config.session_mode != "continuous" {
                     self.session_active = false;
+                    self.should_mute_mic = true;
+                } else {
+                    self.should_mute_mic = false;
                 }
-                self.should_mute_mic = true;
                 if let Err(e) = self.gui_bridge.send_message(r#"{"state": 3}"#).await {
                     log::error!("Failed to send state 3 to GUI: {}", e);
                 }

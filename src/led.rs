@@ -106,8 +106,19 @@ fn paint_loop(state: Arc<AtomicU8>, running: Arc<AtomicBool>) {
     let mut last_painted = String::new();
     let mut frame: u64 = 0;
 
+    let mut dbg_timer = std::time::Instant::now();
     while running.load(Ordering::Relaxed) {
         let code = state.load(Ordering::Relaxed).min(LED_STATE_SPEAKING);
+        if dbg_timer.elapsed() > Duration::from_secs(5) {
+            dbg_timer = std::time::Instant::now();
+            log::info!(
+                "[LED-DBG] state={} muted={} owned={} thr0={}",
+                code,
+                mic_muted(),
+                own.owned,
+                read_trigger(LED_PATHS[0])
+            );
+        }
 
         // Ownership on demand: в idle кольцо возвращается прошивке (Алиса
         // рисует свои индикации через led_ring_fb), забираем только на
