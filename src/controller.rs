@@ -18,6 +18,14 @@ pub struct CoreController {
     net_tx: mpsc::Sender<NetCommand>,
     audio_bridge: Arc<AudioBridge>,
     gui_bridge: Arc<GuiBridge>,
+    led: Option<crate::led::LedRing>,
+    /// Момент последней смены состояния (для watchdog залипшего Processing).
+    state_changed: std::time::Instant,
+    /// Сессия прослушки: микрофон стримится только при активной сессии
+    /// (иначе клиент слышит телек/ambient и сервер отвечает на всё подряд).
+    session_active: bool,
+    /// TTS закончился в сети; ждём фактического конца проигрывания (maind).
+    awaiting_playback: bool,
 }
 
 impl CoreController {
@@ -26,6 +34,7 @@ impl CoreController {
         net_tx: mpsc::Sender<NetCommand>,
         audio_bridge: Arc<AudioBridge>,
         gui_bridge: Arc<GuiBridge>,
+        led: Option<crate::led::LedRing>,
     ) -> Self {
         Self {
             state: SystemState::Idle,
@@ -35,6 +44,57 @@ impl CoreController {
             net_tx,
             audio_bridge,
             gui_bridge,
+            led,
+            state_changed: std::time::Instant::now(),
+            session_active: false,
+            awaiting_playback: false,
+        }
+    }
+
+    /// Watchdog: сервер после VAD-конца шлёт listen stop и пайплайн обязан
+    /// закончиться tts stop. Если Processing висит дольше 30с (потерянный
+    /// ответ) — возвращаемся в idle и сами просим прослушку.
+    pub async fn watchdog_tick(&mut self) {
+        let stuck = match self.state {
+            // сервер потерял tts/stop (зависшая генерация TTS и т.п.)
+            SystemState::Processing => self.state_changed.elapsed() > std::time::Duration::from_secs(30),
+            SystemState::Speaking => self.state_changed.elapsed() > std::time::Duration::from_secs(90),
+            _ => false,
+        };
+        if stuck {
+            log::warn!(
+                "State {:?} stuck >threshold, resetting to idle and re-listening",
+                self.state
+            );
+            self.set_state(SystemState::Idle);
+            self.should_mute_mic = false;
+            if self.session_active {
+                self.send_auto_listen_command().await;
+            }
+        }
+    }
+
+    pub fn led_handle(&self) -> Option<crate::led::LedRing> {
+        self.led.clone()
+    }
+
+    /// Update the internal state and mirror it to the LED ring.
+    fn set_state(&mut self, state: SystemState) {
+        if self.state == state {
+            return;
+        }
+        self.state = state;
+        self.state_changed = std::time::Instant::now();
+        if let Some(led) = &self.led {
+            use crate::state_machine::SystemState as S;
+            use crate::led::*;
+            let code = match state {
+                S::Idle | S::NetworkError => LED_STATE_IDLE,
+                S::Listening => LED_STATE_LISTENING,
+                S::Processing => LED_STATE_PROCESSING,
+                S::Speaking => LED_STATE_SPEAKING,
+            };
+            led.set_state(code);
         }
     }
 
@@ -51,7 +111,7 @@ impl CoreController {
             }
             NetEvent::Disconnected => {
                 log::info!("WebSocket Disconnected");
-                self.state = SystemState::NetworkError;
+                self.set_state(SystemState::NetworkError);
                 if let Err(e) = self.gui_bridge.send_message(r#"{"state": 4}"#).await {
                     log::error!("Failed to send to GUI: {}", e);
                 }
@@ -80,9 +140,8 @@ impl CoreController {
 
         match msg.msg_type.as_str() {
             "hello" => {
-                log::info!("Server Hello received. Starting listen mode...");
-                // 使用正确的 session_id 发送 listen 命令
-                self.send_auto_listen_command().await;
+                log::info!("Server Hello received. Session armed (LED idle, mic closed).");
+                // Прослушка открывается только командой session start (UDP GUI).
             }
             "iot" => {
                 if let Some(cmd) = &msg.command {
@@ -135,19 +194,18 @@ impl CoreController {
                 if let Some(state) = &msg.state {
                     if state == "start" || state == "sentence_start" {
                         self.should_mute_mic = true;
-                        self.state = SystemState::Speaking;
+                        self.awaiting_playback = false;
+                        self.set_state(SystemState::Speaking);
                         log::info!("TTS Started (state={}), muting mic for AEC, sending state 6 to GUI", state);
                         if let Err(e) = self.gui_bridge.send_message(r#"{"state": 6}"#).await {
                             log::error!("Failed to send state 6 to GUI: {}", e);
                         }
                     } else if state == "stop" || state == "sentence_end" {
-                        self.should_mute_mic = false;
-                        self.state = SystemState::Idle;
-                        log::info!("TTS Stopped (state={}), unmuting mic, sending state 3 to GUI", state);
-                        if let Err(e) = self.gui_bridge.send_message(r#"{"state": 3}"#).await {
-                            log::error!("Failed to send state 3 to GUI: {}", e);
-                        }
-                        self.send_auto_listen_command().await;
+                        // Сеть закончила; звук может ещё играть через maind.
+                        // Ждём PlaybackFinished и только потом открываем прослушку.
+                        log::info!("TTS Stopped (state={}), flushing playback tail", state);
+                        self.audio_bridge.flush_playback().await;
+                        self.awaiting_playback = true;
                     }
                 }
 
@@ -178,7 +236,7 @@ impl CoreController {
                 match msg.state.as_deref() {
                     Some("stop") => {
                         self.should_mute_mic = true;
-                        self.state = SystemState::Processing;
+                        self.set_state(SystemState::Processing);
                         log::info!("Server listen stop: muting mic until next listen");
                     }
                     Some("start") => {
@@ -197,7 +255,7 @@ impl CoreController {
     // 处理来自服务器的音频数据
     async fn process_server_audio(&mut self, data: Vec<u8>) {
         if self.state != SystemState::Speaking {
-            self.state = SystemState::Speaking;
+            self.set_state(SystemState::Speaking);
             if let Err(e) = self.gui_bridge.send_message(r#"{"state": 6}"#).await {
                 log::error!("Failed to send to GUI: {}", e);
             }
@@ -222,12 +280,30 @@ impl CoreController {
     // 处理来自 AudioBridge 的事件
     pub async fn handle_audio_event(&mut self, event: AudioEvent) {
         match event {
+            AudioEvent::PlaybackFinished => {
+                // Держим зелёный, пока звук реально играет; обновляем watchdog.
+                self.state_changed = std::time::Instant::now();
+                if !self.awaiting_playback {
+                    return;
+                }
+                self.awaiting_playback = false;
+                // Сессия одноразовая: одна фраза — один цикл. Телек/фон больше
+                // не триггерят; следующая фраза — снова session start (UDP).
+                self.session_active = false;
+                self.should_mute_mic = true;
+                if let Err(e) = self.gui_bridge.send_message(r#"{"state": 3}"#).await {
+                    log::error!("Failed to send state 3 to GUI: {}", e);
+                }
+                self.set_state(SystemState::Idle);
+                log::info!("Playback finished, one-shot session closed (mic muted)");
+                return;
+            }
             AudioEvent::AudioData(data) => {
-                if self.should_mute_mic {
+                if self.should_mute_mic || !self.session_active {
                     return;
                 }
                 if self.state != SystemState::Listening {
-                    self.state = SystemState::Listening;
+                    self.set_state(SystemState::Listening);
                     if let Err(e) = self.gui_bridge.send_message(r#"{"state": 5}"#).await {
                         log::error!("Failed to send to GUI: {}", e);
                     }
@@ -243,8 +319,53 @@ impl CoreController {
     pub async fn handle_gui_event(&mut self, event: GuiEvent) {
         let GuiEvent::Message(msg) = event;
         log::info!("Received Message from GUI: {}", msg);
+
+        // Управление сессией прослушки (UDP с хоста/телефа):
+        //   {"type":"session","state":"start"} — открыть сессию
+        //   {"type":"session","state":"stop"}  — закрыть (микрофон закрыт)
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+                match v.get("state").and_then(|s| s.as_str()) {
+                    Some("start") => return self.session_open().await,
+                    Some("stop") => return self.session_close().await,
+                    _ => {}
+                }
+            }
+        }
+
         if let Err(e) = self.net_tx.send(NetCommand::SendText(msg)).await {
             log::error!("Failed to send text to NetLink: {}", e);
         }
+    }
+
+    /// Открыть сессию: снять мьют, отправить listen start.
+    pub async fn session_open(&mut self) {
+        if self.session_active {
+            return;
+        }
+        self.session_active = true;
+        self.should_mute_mic = false;
+        self.set_state(SystemState::Listening);
+        self.send_auto_listen_command().await;
+        log::info!("Session opened (listening)");
+    }
+
+    /// Закрыть сессию: мьют + listen stop серверу.
+    pub async fn session_close(&mut self) {
+        if !self.session_active {
+            return;
+        }
+        self.session_active = false;
+        self.should_mute_mic = true;
+        self.set_state(SystemState::Idle);
+        let session_id = self.current_session_id.as_deref().unwrap_or("");
+        let stop = format!(
+            r#"{{"session_id":"{}","type":"listen","state":"stop"}}"#,
+            session_id
+        );
+        if let Err(e) = self.net_tx.send(NetCommand::SendText(stop)).await {
+            log::error!("Failed to send listen stop: {}", e);
+        }
+        log::info!("Session closed (mic muted)");
     }
 }

@@ -7,6 +7,7 @@ mod gui_bridge;
 mod mcp_gateway;
 mod net_link;
 mod protocol;
+mod led;
 mod state_machine;
 
 use audio_bridge::{AudioBridge, AudioEvent, PlaybackParams};
@@ -149,26 +150,51 @@ async fn main() -> anyhow::Result<()> {
     // 启动音频桥（内置音频系统，无需外部进程）
     let audio_bridge = Arc::new(AudioBridge::start(&config, tx_audio_event, playback_params)?);
 
+    // LED кольцо (station only): состояния через контроллер, restore на выходе
+    let led_ring = match led::spawn(Arc::new(std::sync::atomic::AtomicU8::new(led::LED_STATE_IDLE))) {
+        Ok(ring) => {
+            log::info!("LED ring control enabled");
+            Some(ring)
+        }
+        Err(e) => {
+            log::info!("LED ring not available: {}", e);
+            None
+        }
+    };
+
     // 初始化控制器
     let mut controller = CoreController::new(
         config.clone(),
         tx_net_cmd,
         audio_bridge,
         gui_bridge,
+        led_ring,
     );
 
     log::info!("Xiaozhi Core Started. Entering Event Loop...");
 
+    let led_for_shutdown = controller.led_handle();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(5));
+
     loop {
         tokio::select! {
+            _ = watchdog.tick() => controller.watchdog_tick().await,
             _ = signal::ctrl_c() => {
                 log::info!("Received Ctrl+C, shutting down...");
+                break;
+            }
+            _ = sigterm.recv() => {
+                log::info!("Received SIGTERM, shutting down...");
                 break;
             }
             Some(event) = rx_net_event.recv() => controller.handle_net_event(event).await,
             Some(event) = rx_audio_event.recv() => controller.handle_audio_event(event).await,
             Some(event) = rx_gui_event.recv() => controller.handle_gui_event(event).await,
         }
+    }
+    if let Some(led) = led_for_shutdown {
+        led.stop(); // restore the stock frame and triggers
     }
     Ok(())
 }
