@@ -1,0 +1,19 @@
+name: sergey004/xiaozhi-station
+version: 0.1.0
+license: MIT
+description: xiaozhi voice client for Yandex Station Lite 2 (vqe_0 capture, maind playback)
+homepage: https://github.com/Sergey004/xiaozhi_yandex_station
+targets: [plum]
+files:
+  bin/xiaozhi_linux_rs: target/aarch64-unknown-linux-musl/release/xiaozhi_linux_rs
+  bin/xiaozhi-start: packaging/yam/xiaozhi-start.sh
+  share/sergey004.xiaozhi-station/config.toml.example: config.toml.example
+  share/sergey004.xiaozhi-station/README.md: README.md
+services:
+  xiaozhi:
+    exec: [bin/xiaozhi-start]
+    restart: on-failure
+    after: [network]
+    env:
+      RUST_LOG: info
+    oneshot: false
