@@ -1,104 +1,109 @@
-# 小智 на Яндекс Станции — Rust-клиент xiaozhi для Yandex Station Lite 2
+# Xiaozhi on Yandex Station — a Rust xiaozhi client for Yandex Station Lite 2
 
-Rust-клиент голосового ассистента [xiaozhi](https://github.com/78/xiaozhi-esp32),
-портированный на **Яндекс Станцию Лайт 2** (Plum): говорит штатным динамиком,
-слушает через **штатный микрофонный тракт Quasar/VQE**, не трогая прошивку.
+[Русский](README_ru.md) | English
 
-Fork [`haoyn231/xiaozhi_linux_rs`](https://github.com/haoyn231/xiaozhi_linux_rs)
-(оригинальный README: [README_upstream.md](README_upstream.md)). Весь ALSA-бэкенд
-хоста, MCP-шлюз и протокол xiaozhi сохранены; добавлен второй аудиобэкенд —
-`station` — и протокольные улучшения.
+A Rust voice-assistant client for the [xiaozhi](https://github.com/78/xiaozhi-esp32)
+protocol, ported to the **Yandex Station Lite 2** (codename *Plum*): it speaks
+through the **stock speaker** and listens through the **stock Quasar/VQE
+microphone pipeline**, without modifying the firmware.
+
+A fork of [`haoyn231/xiaozhi_linux_rs`](https://github.com/haoyn231/xiaozhi_linux_rs)
+(original README: [README_upstream.md](README_upstream.md)). The host ALSA
+backend, the MCP gateway and the xiaozhi protocol are untouched; a second
+audio backend — `station` — plus protocol improvements are added on top.
 
 ```
-        Яндекс Станция Лайт 2                          Ваш сервер
+        Yandex Station Lite 2                        Your server
 ┌─────────────────────────────────────┐      ┌────────────────────────────┐
-│  Quasar (штатный, не изменён)       │      │  xiaozhi-совместимый сервер│
-│   микрофоны → VQE → канал vqe_0     │      │   ASR (Whisper)            │
+│  Quasar (stock, unmodified)         │      │  xiaozhi-protocol server   │
+│   mics → VQE → vqe_0 channel        │      │   ASR (Whisper)            │
 │        │ (LD_PRELOAD tap)           │      │   LLM  → TTS (Chatterbox)  │
-│        ▼  unix datagrams, 10мс      │      │        → RVC (голос)       │
-│  xiaozhi_linux_rs (static aarch64)  │      │   выход 40к → даунлинк 48к │
-│   SpeexDSP → Opus 16к ── WebSocket ─┼──────┤                            │
-│   декодер 48к ← Opus ◄──────────────┼──────┤  per-device downlink:      │
-│        ▼                            │      │   HD-клиентам 48к,         │
-│  maind --gst-launch → динамик ──────┘      │   ESP32 и прочим 16к       │
-│  (усилитель FS2105 управляется maind)      │                            │
+│        ▼  unix datagrams, 10ms      │      │        → RVC (voice clone) │
+│  xiaozhi_linux_rs (static aarch64)  │      │   40k output → 48k link    │
+│   SpeexDSP → Opus 16k ── WebSocket ─┼──────┤                            │
+│   decoder 48k ← Opus ◄──────────────┼──────┤  per-device downlink:      │
+│        ▼                            │      │   HD clients 48k,          │
+│  maind --gst-launch → speaker ──────┘      │   ESP32 and others 16k     │
+│  (FS2105 amp is owned by maind)            │                            │
 └─────────────────────────────────────┘      └────────────────────────────┘
 ```
 
-## Почему так, а не иначе
+## Why it is built this way
 
-Станция — устройство с чужой прошивкой, и порт построен вокруг трёх её
-свойств (проверено на живом железе, см. `docs/` и отчёты):
+The Station ships third-party firmware, and the port is shaped by three of
+its properties (verified on live hardware):
 
-1. **Ядро aarch64, userspace прошивки — 32-bit armhf.** Значит клиент —
-   полностью статический `aarch64-unknown-linux-musl`: ядро исполняет его
-   напрямую, ни одна системная библиотека не нужна (opus/speexdsp/alsa-lib
-   вшиты).
-2. **Усилитель и плеер принадлежат `maind`.** Прямой ALSA-playback из
-   стороннего процесса не слышен (амп заглушен в простое), а dmix-сегмент
-   maind имеет 32-битную раскладку shm. Поэтому playback = `maind
-   --gst-launch`: maind сам управляет усилителем и трактом.
-3. **RVC/обработку микрофона делает Quasar.** Канал `vqe_0` (шумодав,
-   эхоподавление, AGC) экспортируется LD_PRELOAD-хуком и читается клиентом
-   по unix-датаграммам — read-only, Quasar не модифицируется и не
-   перезапускается без явного шага деплоя.
+1. **aarch64 kernel, 32-bit armhf userspace.** The client is therefore a
+   fully static `aarch64-unknown-linux-musl` binary: the kernel executes it
+   directly and no system library is needed (opus/speexdsp/alsa-lib are
+   linked in).
+2. **The amplifier and player belong to `maind`.** Direct ALSA playback from
+   a foreign process is silent (the amp is muted while idle) and maind's
+   dmix segment uses a 32-bit shm layout. So playback goes through
+   `maind --gst-launch`: maind drives its own amp and audio path.
+3. **Quasar owns mic processing.** The `vqe_0` channel (noise suppression,
+   AEC, AGC) is exported by an LD_PRELOAD hook and read by the client over
+   unix datagrams — read-only; Quasar is not modified and not restarted
+   outside an explicit deployment step.
 
-## Что добавлено к апстриму
+## What is added on top of upstream
 
-| Модуль | Что делает |
+| Module | What it does |
 |---|---|
-| `src/audio/station_capture.rs` | захват vqe_0: unix-датаграммы (10 мс, mono 16 кГц) → SpeexDSP (шумодав/AGC) → Opus |
-| `src/audio/station_playback.rs` | декодер **по параметрам server hello** (любой rate/channels) → буфер 2 с → WAV → `maind --gst-launch` |
-| `audio_mode` в конфиге | `alsa` (апстрим-бэкенд) \| `station` — выбор бэкенда, ALSA-путь не тронут |
-| `features.downlink_hd` в hello | пер-девайсный даунлинк: сервер шлёт 48к HD-клиентам и 16к остальным (ESP32-совместимо) |
-| контракт listen stop/start | mic muting по сигналу сервера (server-side VAD), обработка `llm`/`stt` |
-| `bin/fake_server` | мини-сервер протокола xiaozhi (OTA + WS + TTS-бёрст) для сквозного теста без сети |
-| `config.toml.example` | шаблон конфига; `config.toml` device-специфичен и в gitignore, build.rs умеет фоллбэк |
+| `src/audio/station_capture.rs` | vqe_0 capture: unix datagrams (10 ms, mono 16 kHz) → SpeexDSP (denoise/AGC) → Opus |
+| `src/audio/station_playback.rs` | decoder built **from the server hello** (any rate/channels) → 2 s buffer → WAV → `maind --gst-launch` |
+| `audio_mode` config | `alsa` (upstream backend) \| `station` — backend switch; the ALSA path is untouched |
+| `features.downlink_hd` in hello | per-device downlink: the server sends 48k to HD clients and 16k to the rest (ESP32-compatible) |
+| listen stop/start contract | mic muting on the server-side VAD signal, `llm`/`stt` message handling |
+| `bin/fake_server` | a minimal xiaozhi-protocol test server (OTA + WS + TTS burst) for network-free end-to-end tests |
+| `config.toml.example` | config template; `config.toml` is device-specific and gitignored, build.rs falls back to the example |
 
-## Серверная сторона
+## Server side
 
-Парный репозиторий [`Sergey004/xiaozhi_bridge`](https://github.com/Sergey004/xiaozhi_bridge):
-`xiaozhi_server.py` — xiaozhi-совместимый сервер (OTA + WS-мост + API) с пайплайном
-**Chatterbox TTS → RVC** (свой голос из референса), автовыравниванием высоты
-(медианная f0 референса и генерации → точный полутоновый сдвиг: выход 139 Гц
-при цели 142) и per-device даунлинком 48к/16к.
+The companion repo [`Sergey004/xiaozhi_bridge`](https://github.com/Sergey004/xiaozhi_bridge):
+`xiaozhi_server.py` — an all-in-one xiaozhi server (OTA + WS bridge + API)
+with a **Chatterbox TTS → RVC** pipeline (your own cloned voice), automatic
+pitch alignment (median f0 of the reference vs the generated audio → exact
+semitone shift: output lands at 139 Hz against a 142 Hz target) and
+per-device 48k/16k downlink.
 
-## Сборка и деплой
+## Build & deploy
 
-Требования к хосту: Rust 1.85+, кросс-тулчейн `aarch64-linux-musl` (musl.cc),
-pkg-config. Скрипт сборки статических зависимостей — `src-deps/build-static.sh`
-(alsa-lib/opus/speexdsp → sysroot), см. отчёты.
+Host requirements: Rust 1.85+, an `aarch64-linux-musl` cross toolchain
+(musl.cc), pkg-config. The static-dependency build script is
+`src-deps/build-static.sh` (alsa-lib/opus/speexdsp → sysroot); see the
+reports for details.
 
 ```bash
-cp config.toml.example config.toml        # свои адреса/токен
+cp config.toml.example config.toml        # your addresses/token
 # build (env: PKG_CONFIG_LIBDIR=<sysroot>/lib/pkgconfig, PKG_CONFIG_SYSROOT_DIR=<sysroot>,
 #        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=<tc>/aarch64-linux-musl-gcc)
 cargo build --release --target aarch64-unknown-linux-musl
-# ELF64 aarch64, statically linked, ~3.6 МБ
+# ELF64 aarch64, statically linked, ~3.6 MB
 ```
 
-На станции (root, SSH): каталог `/data/opt/xiaozhi/` — бинарник +
-`xiaozhi_config.json` (`audio_mode: "station"`, `station_capture_socket`,
-адрес сервера), запуск вручную `./xiaozhi_linux_rs` из этого каталога.
-Корневая ФС остаётся read-only, штатные сервисы (`S99quasar` и пр.) не
-трогаются, откат — удаление каталога.
+On the Station (root, SSH): the `/data/opt/xiaozhi/` directory holds the
+binary + `xiaozhi_config.json` (`audio_mode: "station"`,
+`station_capture_socket`, server address); run `./xiaozhi_linux_rs` manually
+from that directory. The root filesystem stays read-only, stock services
+(`S99quasar` etc.) are untouched, and rollback is deleting the directory.
 
-## Статус
+## Status
 
-- [x] сквозной голосовой цикл: vqe_0 → сервер (STT/LLM/TTS) → динамик
-- [x] 48к даунлинк с автовыравниванием высоты голоса
-- [x] пер-девайсное согласование (HD-клиент 48к / ESP32 16к)
-- [ ] LED-кольцо (sysfs-механика известна: `plum:{r,g,b}:ring1-3`, mute-гард)
-- [ ] автозапуск клиента
-- [ ] плавность TTS (префетч чанков)
+- [x] full voice loop: vqe_0 → server (STT/LLM/TTS) → speaker
+- [x] 48k downlink with automatic voice-pitch alignment
+- [x] per-device rate negotiation (HD client 48k / ESP32 16k)
+- [ ] LED ring (sysfs mechanics known: `plum:{r,g,b}:ring1-3`, mute guard)
+- [ ] client autostart
+- [ ] TTS smoothness (chunk prefetch)
 
-## Благодарности
+## Credits
 
-- [`haoyn231/xiaozhi_linux_rs`](https://github.com/haoyn231/xiaozhi_linux_rs) — база
-- [`78/xiaozhi-esp32`](https://github.com/78/xiaozhi-esp32) — протокол
-- [`skrashevich/quasar-bridge`](https://github.com/skrashevich/quasar-bridge) — внутренности uniproxy/директив
-- [`rison1337/Alisa-ChatGPT-voice-assistant`](https://github.com/rison1337/Alisa-ChatGPT-voice-assistant) — vqe_tap и работа с железом
-- сообщество [hackalice.me](https://hackalice.me) — рецепты станции
+- [`haoyn231/xiaozhi_linux_rs`](https://github.com/haoyn231/xiaozhi_linux_rs) — the base
+- [`78/xiaozhi-esp32`](https://github.com/78/xiaozhi-esp32) — the protocol
+- [`skrashevich/quasar-bridge`](https://github.com/skrashevich/quasar-bridge) — uniproxy internals
+- [`rison1337/Alisa-ChatGPT-voice-assistant`](https://github.com/rison1337/Alisa-ChatGPT-voice-assistant) — vqe_tap and hardware research
+- the [hackalice.me](https://hackalice.me) community — Station recipes
 
-Лицензия — [MIT](LICENSE) (как у апстрима). Бинарник также линкует ALSA (LGPL),
-Opus и SpeexDSP — при дистрибуции соблюдайте их условия.
+License: [MIT](LICENSE) (same as upstream). The binary also links ALSA (LGPL),
+Opus and SpeexDSP — respect their terms when redistributing.
