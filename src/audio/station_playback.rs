@@ -143,6 +143,9 @@ pub fn playback_thread(
     let mut last_activity = Instant::now();
     let mut pcm: Vec<i16> = Vec::new();
     let mut consecutive_failures: u32 = 0;
+    // tts/stop получен, но последние кадры могут прийти позже: ждём их и
+    // доигрываем, прежде чем уведомить контроллер о конце проигрывания.
+    let mut pending_finish = false;
     log::info!(
         "Station playback: streaming mode (persistent maind pipeline), opus {}Hz/{}ch",
         config.opus_sample_rate,
@@ -214,8 +217,20 @@ pub fn playback_thread(
 
         let mut finish_reply = false;
         match action {
-            Action::Timeout => continue,
-            Action::Flush => finish_reply = true,
+            Action::Timeout => {
+                if pending_finish && pcm.is_empty() {
+                    rt.block_on(async {
+                        let _ = event_tx.send(AudioEvent::PlaybackFinished).await;
+                    });
+                    pending_finish = false;
+                    log::info!("Playback finished (drained)");
+                }
+                continue;
+            }
+            Action::Flush => {
+                finish_reply = true;
+                pending_finish = true;
+            }
             Action::Closed => {
                 log::info!("Playback channel closed");
                 break;
@@ -288,10 +303,6 @@ pub fn playback_thread(
                 let _ = p.write_silence_ms(TAIL_SILENCE_MS);
                 last_activity = Instant::now();
             }
-            rt.block_on(async {
-                let _ = event_tx.send(AudioEvent::PlaybackFinished).await;
-            });
-            std::thread::sleep(Duration::from_millis(DRAIN_WAIT_MS));
             if player.is_some() {
                 last_activity = Instant::now();
             }

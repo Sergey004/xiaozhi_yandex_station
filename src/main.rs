@@ -4,7 +4,6 @@ mod audio_bridge;
 mod config;
 mod controller;
 mod gui_bridge;
-mod mcp_gateway;
 mod net_link;
 mod protocol;
 mod led;
@@ -21,7 +20,6 @@ use std::sync::{Arc, RwLock};
 use tokio::signal;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use crate::mcp_gateway::init_mcp_gateway;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -69,17 +67,6 @@ async fn main() -> anyhow::Result<()> {
             log::error!("Failed to persist updated config: {}", e);
         }
     }
-
-    // 初始化 MCP Gateway 工具箱
-    let mcp_configs = if config.mcp.enabled {
-        log::info!("MCP Gateway is enabled. Loaded {} tools from configuration.", config.mcp.tools.len());
-        config.mcp.tools.clone()
-    } else {
-        log::info!("MCP Gateway is disabled.");
-        vec![]
-    };
-
-    let mcp_server = Arc::new(init_mcp_gateway(mcp_configs));
 
     // 创建通道，用于组件间通信
     // 事件通道
@@ -142,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 启动网络链接，与小智服务器通信
     let playback_params: PlaybackParams = Arc::new(RwLock::new(None));
-    let net_link = NetLink::new(config.clone(), tx_net_event, rx_net_cmd, mcp_server, playback_params.clone());
+    let net_link = NetLink::new(config.clone(), tx_net_event, rx_net_cmd, playback_params.clone());
     tokio::spawn(async move {
         net_link.run().await;
     });

@@ -12,7 +12,6 @@ struct Config {
     network: Network,
     hello_message: HelloMessage,
     features: Features,
-    mcp: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -38,12 +37,18 @@ struct Audio {
     playback_period_size: usize,
     #[serde(default = "default_audio_mode")]
     audio_mode: String,
+    #[serde(default = "default_session_mode")]
+    session_mode: String,
     #[serde(default)]
     station_capture_socket: String,
 }
 
 fn default_audio_mode() -> String {
     "alsa".to_string()
+}
+
+fn default_session_mode() -> String {
+    "continuous".to_string()
 }
 
 #[derive(Deserialize)]
@@ -134,6 +139,7 @@ fn main() {
         "cargo:rustc-env=STATION_CAPTURE_SOCKET={}",
         config.audio.station_capture_socket
     );
+    println!("cargo:rustc-env=SESSION_MODE={}", config.audio.session_mode);
 
     // GUI 配置
     println!("cargo:rustc-env=GUI_LOCAL_PORT={}", config.gui.local_port);
@@ -173,9 +179,6 @@ fn main() {
         config.features.enable_tts_display
     );
 
-    // MCP配置
-    let mcp_json = serde_json::to_string(&config.mcp).expect("Failed to serialize mcp config");
-    println!("cargo:rustc-env=MCP_CONFIG_JSON={}", mcp_json);
 
     // 交叉编译配置
     let target = env::var("TARGET").unwrap_or_default();

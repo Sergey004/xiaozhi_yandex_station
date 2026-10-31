@@ -7,8 +7,6 @@ use crate::state_machine::SystemState;
 use serde_json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::process::Command;
-use std::process::Stdio;
 
 pub struct CoreController {
     state: SystemState,
@@ -144,51 +142,10 @@ impl CoreController {
                 // Прослушка открывается только командой session start (UDP GUI).
             }
             "iot" => {
+                // IoT-команды исполняет серверная сторона; клиенту остаётся лог
                 if let Some(cmd) = &msg.command {
-                    log::info!("Processing IoT Command: {}", cmd);
+                    log::info!("IoT Command (server-side): {}", cmd);
                 }
-                
-                // Fallback: 把接收到的完整 JSON 传递给外部脚本执行
-                let fallback_script = "./scripts/mcp_iot_fallback.sh";
-                let text_clone = text.clone();
-                tokio::spawn(async move {
-                    let mut child = match Command::new(fallback_script)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log::error!("Failed to spawn IoT fallback script {}: {}", fallback_script, e);
-                            return;
-                        }
-                    };
-                    
-                    if let Some(mut stdin) = child.stdin.take() {
-                        use tokio::io::AsyncWriteExt;
-                        if let Err(e) = stdin.write_all(text_clone.as_bytes()).await {
-                            log::error!("Failed to write to IoT fallback script stdin: {}", e);
-                        }
-                    }
-                    
-                    match child.wait_with_output().await {
-                        Ok(output) => {
-                            if !output.status.success() {
-                                let err_str = String::from_utf8_lossy(&output.stderr);
-                                log::error!("IoT fallback script failed: {}", err_str);
-                            } else {
-                                let out_str = String::from_utf8_lossy(&output.stdout);
-                                if !out_str.trim().is_empty() {
-                                    log::info!("IoT fallback script output: {}", out_str);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to wait for IoT fallback script: {}", e);
-                        }
-                    }
-                });
             }
             "tts" => {
                 if let Some(state) = &msg.state {
@@ -292,12 +249,20 @@ impl CoreController {
                     return;
                 }
                 self.awaiting_playback = false;
-                // Сессия одноразовая: одна фраза — один цикл. Телек/фон больше
-                // не триггерят; следующая фраза — снова session start (UDP).
-                self.session_active = false;
+                // single: одна фраза — один цикл (анти-телевизор).
+                // continuous: открываем прослушку снова — диалог внутри сессии.
+                if self.config.session_mode != "continuous" {
+                    self.session_active = false;
+                }
                 self.should_mute_mic = true;
                 if let Err(e) = self.gui_bridge.send_message(r#"{"state": 3}"#).await {
                     log::error!("Failed to send state 3 to GUI: {}", e);
+                }
+                if self.session_active && self.config.session_mode == "continuous" {
+                    self.set_state(SystemState::Listening);
+                    self.send_auto_listen_command().await;
+                    log::info!("Playback finished, listening (continuous session)");
+                    return;
                 }
                 self.set_state(SystemState::Idle);
                 log::info!("Playback finished, one-shot session closed (mic muted)");

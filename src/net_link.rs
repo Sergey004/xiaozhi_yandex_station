@@ -9,7 +9,6 @@ use url::Url;
 use uuid::Uuid;
 use std::sync::Arc;
 use crate::audio_bridge::PlaybackParams;
-use crate::mcp_gateway::McpServer;
 
 #[derive(Debug)]
 pub enum NetEvent {
@@ -37,8 +36,6 @@ struct AudioParams {
 // Features 声明结构体，用于告知服务端设备支持的能力
 #[derive(Serialize)]
 struct Features {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mcp: Option<bool>,
     /// Сервер шлёт даунлинк в полном качестве (48к) вместо безопасных 16к:
     /// клиент подстраивает декодер под audio_params из server hello.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,7 +58,6 @@ pub struct NetLink {
     config: Config,
     tx: mpsc::Sender<NetEvent>,
     rx_cmd: mpsc::Receiver<NetCommand>,
-    mcp_server: Arc<McpServer>,
     playback_params: PlaybackParams,
 }
 
@@ -70,10 +66,9 @@ impl NetLink {
         config: Config,
         tx: mpsc::Sender<NetEvent>,
         rx_cmd: mpsc::Receiver<NetCommand>,
-        mcp_server: Arc<McpServer>,
         playback_params: PlaybackParams,
     ) -> Self {
-        Self { config, tx, rx_cmd, mcp_server, playback_params }
+        Self { config, tx, rx_cmd, playback_params }
     }
 
     /// Parse the server hello's audio_params (downlink declaration) and store
@@ -161,10 +156,7 @@ impl NetLink {
         // 发送Hello消息进行初始化链接
         // 根据配置动态决定是否在 hello 中声明 MCP 能力
         // downlink_hd: клиент декодирует любой rate из server hello — просим 48к
-        let features = Some(Features {
-            mcp: if self.config.mcp.enabled { Some(true) } else { None },
-            downlink_hd: Some(true),
-        });
+        let features = Some(Features { downlink_hd: Some(true) });
         let hello_msg = HelloMessage {
             msg_type: "hello".to_string(),
             version: 1,
@@ -192,49 +184,10 @@ impl NetLink {
                                 Message::Text(text) => {
                                     // 尝试解析消息，检查是否为 MCP 信封格式
                                     // 服务端下发的 MCP 消息格式: {"type":"mcp","payload":{JSON-RPC},"session_id":"..."}
-                                    let handled = if let Ok(envelope) = serde_json::from_str::<Value>(&text) {
-                                        if envelope.get("type").and_then(|t| t.as_str()) == Some("mcp") {
-                                            if let Some(payload) = envelope.get("payload") {
-                                                let payload_str = payload.to_string();
-                                                log::info!("MCP Request: {}", payload_str);
-                                                if let Some(mcp_response) = self.mcp_server.handle_message(&payload_str).await {
-                                                    if mcp_response.is_empty() {
-                                                        // 通知消息，无需回复
-                                                        true
-                                                    } else {
-                                                        // 将 MCP 响应包装回信封格式发送
-                                                        let session_id = envelope.get("session_id")
-                                                            .and_then(|s| s.as_str())
-                                                            .unwrap_or("");
-                                                        let response_envelope = json!({
-                                                            "type": "mcp",
-                                                            "session_id": session_id,
-                                                            "payload": serde_json::from_str::<Value>(&mcp_response).unwrap_or(Value::Null)
-                                                        });
-                                                        let response_text = serde_json::to_string(&response_envelope).unwrap();
-                                                        log::info!("MCP Response: {}", response_text);
-                                                        write.send(Message::Text(response_text.into())).await?;
-                                                        true
-                                                    }
-                                                } else {
-                                                    false
-                                                }
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    };
-
-                                    if !handled {
-                                        // 正常信令通道处理
-                                        log::info!("Received Text: {}", text);
-                                        self.update_playback_params(&text);
-                                        self.tx.send(NetEvent::Text(text.to_string())).await?;
-                                    }
+                                    // 正常信令通道处理
+                                    log::info!("Received Text: {}", text);
+                                    self.update_playback_params(&text);
+                                    self.tx.send(NetEvent::Text(text.to_string())).await?;
                                 }
                                 Message::Binary(data) => {
                                     self.tx.send(NetEvent::Binary(data.to_vec())).await?;

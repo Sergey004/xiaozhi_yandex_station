@@ -24,6 +24,8 @@ playback_period_size = 960
 # Audio backend: "alsa" (default Linux) | "station" (Yandex Station:
 # mic from Quasar vqe_0 tap, playback via maind --gst-launch)
 # audio_mode = "station"
+# Сессия прослушки: continuous (диалог) | single (одна фраза на открытие)
+# session_mode = "continuous"
 # station_capture_socket = "/data/opt/xiaozhi/mic.sock"
 
 # GUI process (UDP IPC), optional
@@ -55,16 +57,3 @@ channels = 1
 frame_duration = 60
 
 # MCP tools (optional)
-[mcp]
-enabled = false
-
-# [[mcp.tools]]
-# name = "get_system_status"
-# description = "..."
-# type = "subprocess"
-# executable = "./system_status.sh"
-# mode = "sync"
-# timeout_ms = 5000
-# [mcp.tools.input_schema]
-# type = "object"
-# [mcp.tools.input_schema.properties]
