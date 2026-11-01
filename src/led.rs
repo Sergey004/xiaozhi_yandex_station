@@ -41,8 +41,8 @@ const LED_PATHS: [&str; 9] = [
     "plum:green:ring3",
     "plum:blue:ring3",
 ];
-/// Animation frames per second.
-const FPS: u32 = 10;
+/// Animation rate: 60 FPS (16.6ms per frame).
+const FPS: u32 = 60;
 
 /// (r,g,b) per zone for each state code; the 9-LED frame repeats the zone
 /// color across ring1..ring3.
@@ -104,7 +104,7 @@ fn paint_loop(state: Arc<AtomicU8>, running: Arc<AtomicBool>) {
         saved_triggers: ["none".into(), "none".into(), "none".into(), "none".into(), "none".into(), "none".into(), "none".into(), "none".into(), "none".into()],
     };
     let mut last_painted = String::new();
-    let mut frame: u64 = 0;
+    let start = std::time::Instant::now();
 
     let mut dbg_timer = std::time::Instant::now();
     while running.load(Ordering::Relaxed) {
@@ -159,22 +159,54 @@ fn paint_loop(state: Arc<AtomicU8>, running: Arc<AtomicBool>) {
             }
         }
 
+        // Анимации 60 FPS, всё от монотонного времени (гладко, без рывков):
+        // listening — вращающееся свечение (спиннер с перекрытием позиций),
+        // processing — янтарный пульс, speaking — зелёное дыхание.
+        let t = start.elapsed().as_secs_f32();
         let color = COLORS[code as usize];
-        let scale = if code == LED_STATE_IDLE {
-            1.0
-        } else {
-            0.75 + 0.25 * ((frame as f32 / FPS as f32) * std::f32::consts::PI).sin().abs()
-        };
-        let f = [
-            (color.0 as f32 * scale) as u8,
-            (color.1 as f32 * scale) as u8,
-            (color.2 as f32 * scale) as u8,
-        ];
-        // Frame order: r1,g1,b1,r2,g2,b2,r3,g3,b3 — same zone across rings.
-        let painted = [f[0], f[1], f[2], f[0], f[1], f[2], f[0], f[1], f[2]];
-        paint_frame(&painted);
-        last_painted = frame_string(&painted);
-        frame += 1;
+        let mut f = [0u8; 9];
+        let tau = std::f32::consts::TAU;
+        match code {
+            LED_STATE_LISTENING => {
+                // Спиннер: свечение бегает по 3 позициям (900мс/оборот),
+                // соседние позиции подсвечены с фазовым сдвигом 120°
+                let period = 0.9f32;
+                for pos in 0..3 {
+                    let ang = (t % period) / period * tau - pos as f32 * (tau / 3.0);
+                    let glow = ((ang.sin() + 1.0) / 2.0).powi(2);
+                    f[pos * 3] = (color.0 as f32 * glow) as u8;
+                    f[pos * 3 + 1] = (color.1 as f32 * glow) as u8;
+                    f[pos * 3 + 2] = (color.2 as f32 * glow) as u8;
+                }
+            }
+            LED_STATE_PROCESSING => {
+                // Пульс: 1.2с цикл
+                let p = 0.5 + 0.5 * (t * tau / 1.2).sin();
+                for ring in 0..3 {
+                    f[ring * 3] = (color.0 as f32 * p) as u8;
+                    f[ring * 3 + 1] = (color.1 as f32 * p) as u8;
+                    f[ring * 3 + 2] = (color.2 as f32 * p) as u8;
+                }
+            }
+            LED_STATE_SPEAKING => {
+                // Дыхание: 1.6с цикл
+                let scale = 0.55 + 0.45 * (t * tau / 1.6).sin().abs();
+                for ring in 0..3 {
+                    f[ring * 3] = (color.0 as f32 * scale) as u8;
+                    f[ring * 3 + 1] = (color.1 as f32 * scale) as u8;
+                    f[ring * 3 + 2] = (color.2 as f32 * scale) as u8;
+                }
+            }
+            _ => {
+                for ring in 0..3 {
+                    f[ring * 3] = color.0;
+                    f[ring * 3 + 1] = color.1;
+                    f[ring * 3 + 2] = color.2;
+                }
+            }
+        }
+        paint_frame(&f);
+        last_painted = frame_string(&f);
         std::thread::sleep(Duration::from_millis(1000 / FPS as u64));
     }
 
